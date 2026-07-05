@@ -1,9 +1,11 @@
 output "instance_id" {
-  description = "The ID of the EC2 instance"
-  value       = aws_instance.web_server.id
+  value = aws_instance.web_server.id
 }
 
-output "instance_public_ip" {
-  description = "The public IP address of the EC2 instance"
-  value       = aws_instance.web_server.public_ip
+output "public_ip" {
+  value = aws_instance.web_server.public_ip
+}
+
+output "ssm_role" {
+  value = aws_iam_role.ec2_ssm_role.name
 }
