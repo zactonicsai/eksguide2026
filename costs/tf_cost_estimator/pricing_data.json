@@ -1,0 +1,66 @@
+{
+  "metadata": {
+    "region": "us-east-1",
+    "os": "Linux",
+    "purchase_option": "On-Demand",
+    "snapshot_date": "2026-07-05",
+    "sources": [
+      "https://aws.amazon.com/ec2/pricing/on-demand/",
+      "https://aws.amazon.com/elasticloadbalancing/pricing/",
+      "https://aws.amazon.com/vpc/pricing/",
+      "https://aws.amazon.com/rds/pricing/",
+      "https://aws.amazon.com/ebs/pricing/"
+    ],
+    "notes": "Hand-maintained point-in-time snapshot of US East (N. Virginia) On-Demand Linux list prices. AWS changes prices over time and by region - re-check https://calculator.aws for anything budget-critical, and update this file's numbers periodically."
+  },
+
+  "hours_per_month": 730,
+
+  "ec2_hourly": {
+    "t2.nano": 0.0058, "t2.micro": 0.0116, "t2.small": 0.023, "t2.medium": 0.0464, "t2.large": 0.0928,
+    "t3.nano": 0.0052, "t3.micro": 0.0104, "t3.small": 0.0208, "t3.medium": 0.0416, "t3.large": 0.0832, "t3.xlarge": 0.1664, "t3.2xlarge": 0.3328,
+    "t3a.nano": 0.0047, "t3a.micro": 0.0094, "t3a.small": 0.0188, "t3a.medium": 0.0376, "t3a.large": 0.0752,
+    "t4g.nano": 0.0042, "t4g.micro": 0.0084, "t4g.small": 0.0168, "t4g.medium": 0.0336, "t4g.large": 0.0672,
+    "m5.large": 0.096, "m5.xlarge": 0.192, "m5.2xlarge": 0.384,
+    "m6i.large": 0.096, "m6i.xlarge": 0.192,
+    "c5.large": 0.085, "c5.xlarge": 0.17,
+    "r5.large": 0.126, "r5.xlarge": 0.252
+  },
+
+  "ebs_gb_month": {
+    "gp3": 0.08,
+    "gp2": 0.10,
+    "io1": 0.125,
+    "io2": 0.125,
+    "st1": 0.045,
+    "sc1": 0.015
+  },
+
+  "load_balancer": {
+    "application": { "hourly": 0.0225, "capacity_unit_hourly": 0.008,  "capacity_unit_name": "LCU" },
+    "network":      { "hourly": 0.0225, "capacity_unit_hourly": 0.006,  "capacity_unit_name": "NLCU" },
+    "gateway":      { "hourly": 0.0125, "capacity_unit_hourly": 0.004,  "capacity_unit_name": "GLCU" },
+    "classic":      { "hourly": 0.025,  "capacity_unit_hourly": 0.008,  "capacity_unit_name": "GB processed" }
+  },
+
+  "nat_gateway": {
+    "hourly": 0.045,
+    "gb_processed": 0.045
+  },
+
+  "vpc_endpoint": {
+    "gateway_hourly": 0.0,
+    "interface_hourly": 0.01,
+    "interface_gb_processed": 0.01
+  },
+
+  "eip_idle_hourly": 0.005,
+
+  "rds_hourly": {
+    "db.t3.micro": 0.03,
+    "db.t3.small": 0.06,
+    "db.t3.medium": 0.12,
+    "db.t3.large": 0.24,
+    "db.m5.large": 0.171
+  }
+}
