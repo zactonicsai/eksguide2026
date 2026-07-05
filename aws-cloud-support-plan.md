@@ -38,6 +38,7 @@
 | **Observability** | CloudWatch, EKS control-plane logs, Prometheus (AMP via VPC endpoint or self-hosted) + self-hosted Grafana, alerting to corp on-call |
 | **Cost** | Tagging enforcement, budgets, anomaly detection, CUR/Athena reporting, EKS split cost allocation, right-sizing reviews |
 | **Data services (infra layer)** | Amazon OpenSearch domains (the **only** AWS-managed data service) plus the platforms the self-managed services run on: pre-req'd EC2 "data nodes" and EKS capacity for Kafka (Strimzi), NiFi, and PostgreSQL — machine vending, prerequisites, disks, scaling, patching, backup plumbing. Software install/config and app-level content (topics/indices/schemas/flows/models) belong to the data team, with platform support |
+| **CI/CD (GitLab)** | GitLab runner fleets inside the VPC (Kubernetes executor on EKS + EC2 autoscaling runners), runner IAM roles & OIDC federation into AWS, S3 job cache, shared pipeline templates and guardrails. The GitLab server itself is corp-hosted; pipeline *content* (`.gitlab-ci.yml`) belongs to the teams |
 
 ### 1.2 Air-gap ground rules (apply to every example in this document)
 
@@ -46,6 +47,7 @@
 - **Public image references are rewritten** to the mirror at the containerd layer (`/etc/containerd/certs.d`) so upstream manifests (Strimzi, NiFi, Keycloak, NVIDIA) work unmodified — see §4.6.
 - **Humans reach the environment only via corp network** (Transit Gateway / Direct Connect) and administer EC2 via **SSM Session Manager** (no SSH keys, no bastion port 22).
 - **Amazon OpenSearch Service is the only AWS-managed data service** (VPC domain — its ENIs live inside your subnets, fully air-gap compatible). Everything else — Kafka, NiFi, PostgreSQL — is self-managed: containerized on EKS (Strimzi, NiFi StatefulSets, CloudNativePG) or on platform-vended EC2 **data nodes**, with all software installed from the internal mirror by the data teams.
+- **CI/CD runs inside the gap too.** GitLab (self-managed) lives on the corp network; the platform team operates the **runner fleets inside the VPC** (EKS Kubernetes executor + EC2 autoscaling). Jobs pull images only from ECR, cache to S3 via the gateway endpoint, and reach AWS with **short-lived, per-project IAM roles** (§4.10) — no long-lived cloud keys in CI variables, ever.
 
 ### 1.3 Reference architecture
 
@@ -76,6 +78,9 @@ Corp Network ──DX/VPN── Transit Gateway ──── ATTACH ────
   │  AWS-managed (the ONLY one): Amazon OpenSearch Service 2.19/3.x — VPC domain, 3 AZ,
   │   dedicated masters
   │
+  │  CI/CD: GitLab (corp, over TGW) ⇐ runner fleets in-VPC — K8s executor on EKS (ns ci-jobs)
+  │         + EC2 autoscaling runners (fleeting/ASG, golden AMI); jobs assume per-team IAM roles
+  │
   │  Supply chain: Harbor (EC2/EKS) ⇒ ECR replicas ⇒ nodes pull via ecr.dkr endpoint
   │  VPC endpoints: s3(gw), ecr.api, ecr.dkr, ec2, sts, eks, eks-auth, ssm, ssmmessages,
   │                 ec2messages, logs, monitoring, elasticloadbalancing, autoscaling,
@@ -105,6 +110,7 @@ Corp Network ──DX/VPN── Transit Gateway ──── ATTACH ────
 | Keycloak | 26.x | OIDC IdP for EKS + apps |
 | Terraform | ≥ 1.10 (S3-native state locking) + AWS provider ~> 6.0 | Providers from internal mirror |
 | AWS CLI | v2 (current) | Via internal installer repo |
+| GitLab + Runner | Self-managed GitLab (corp-hosted); **runner minor tracks the GitLab minor** — chart + helper image from the mirror | Helper image pinned to ECR (§4.10) |
 
 ---
 
@@ -124,6 +130,9 @@ Corp Network ──DX/VPN── Transit Gateway ──── ATTACH ────
 | Incident response — infra layer | **R/A** | C | C | |
 | Zero-day containment & forensics | **R** | C | **A** | Security leads, platform executes |
 | Cost monitoring & showback | **R/A** | R (optimize own workloads) | I | |
+| GitLab runner fleets (EKS + EC2), runner IAM/OIDC, S3 cache | **R/A** | C | C | Runner infra & identity = platform |
+| Pipeline definitions (`.gitlab-ci.yml`), project CI config | C | **R/A** | I | Platform provides templates + review |
+| CI deploy roles per team (scope, trust conditions) | **R/A** | R (requests) | C | Least-priv; audited with §6.11 |
 
 ---
 
@@ -148,6 +157,7 @@ Corp Network ──DX/VPN── Transit Gateway ──── ATTACH ────
 | D13 | Networking | VPC endpoint health alarms, TGW attachment state, DNS resolver metrics | CloudWatch | §5.1 (sweep) |
 | D14 | Backups | Verify last night's backup jobs (AWS Backup/EBS, Velero, CNPG barman, OpenSearch snapshots) succeeded | AWS Backup CLI / velero / kubectl | §5.1 (sweep) |
 | D15 | Data-node EC2 | Fleet heartbeat (SSM ping), `/data` disk & memory alarms, failed systemd units, prereq-association compliance | SSM + CloudWatch agent | §5.13 |
+| D16 | CI/CD | Runner fleet health (pods/ASG), offline/stale runners in GitLab, job-queue latency, S3 cache reachability | kubectl + GitLab API + Prometheus | §5.14 |
 
 ### 3.2 Periodic
 
@@ -169,6 +179,7 @@ Corp Network ──DX/VPN── Transit Gateway ──── ATTACH ────
 | P14 | Monthly | Karpenter/add-on/chart version bumps from mirror (vpc-cni, coredns, ebs-csi, pod-identity-agent, device plugin) | §6.4 (add-ons) |
 | P15 | Quarterly | Game-day: execute one What-If scenario from §8 as a drill | §8 |
 | P16 | On request / AMI cycle | Vend new data-node EC2 (Terraform module) and rebuild existing ones onto the current golden AMI (blue/green per node) | §4.9.2 / §6.3 |
+| P17 | With each GitLab upgrade / quarterly | Runner chart + fleeting-AMI upgrade behind a canary-pipeline gate; runner token rotation; CI deploy-role audit (CloudTrail sessions by `gl-` prefix) | §6.13 |
 
 ### 3.3 Zero-Day / Emergency
 
@@ -1183,6 +1194,167 @@ resource "aws_opensearch_domain" "main" {
 }
 ```
 
+### 4.10 GitLab CI/CD — cloud runners and IAM roles
+
+GitLab (server) is corp-hosted and reached over the TGW; **everything that executes lives in the VPC** and follows every rule above: images from ECR only, cache to S3 through the gateway endpoint, hosts on the golden AMI, no internet.
+
+#### 4.10.1 Kubernetes-executor fleet on EKS
+
+```yaml
+# corp-helm/gitlab-runner — values-airgap.yaml (chart + images mirrored)
+gitlabUrl: https://gitlab.corp.example.com
+rbac: { create: true }
+serviceAccount: { name: gitlab-runner }        # EKS Pod Identity → role "ci-runner-base" (4.10.3)
+runners:
+  secret: gitlab-runner-token                  # runner AUTHENTICATION token (created in GitLab, stored as k8s Secret)
+  config: |
+    concurrent = 30
+    check_interval = 3
+    [[runners]]
+      executor = "kubernetes"
+      [runners.kubernetes]
+        namespace = "ci-jobs"
+        service_account = "ci-job"
+        image = "111122223333.dkr.ecr.us-east-1.amazonaws.com/tools/ci-base:al2023"
+        # CRITICAL air-gap pin — the default helper pulls from registry.gitlab.com and hangs forever.
+        # Keep the tag in lockstep with the chart version (§6.13):
+        helper_image = "111122223333.dkr.ecr.us-east-1.amazonaws.com/mirrored/gitlab-org/gitlab-runner-helper:x86_64-v<runner-version>"
+        pull_policy = ["if-not-present"]
+        privileged = false                     # no docker-in-docker — image builds use kaniko → Harbor
+        [runners.kubernetes.node_selector]
+          "corp/workload" = "general"
+      [runners.cache]
+        Type = "s3"
+        Shared = true
+        [runners.cache.s3]
+          ServerAddress = "s3.us-east-1.amazonaws.com"   # rides the S3 gateway endpoint
+          BucketName = "corp-ci-cache"                   # lifecycle: expire objects after 14d
+          BucketLocation = "us-east-1"
+          AuthenticationType = "iam"
+```
+
+Deploy one release per runner class — `general`, `gpu` (tolerates `nvidia.com/gpu`, requests one GPU, tag `gpu`), and `builds` (kaniko, higher resources) — each with its own tags so teams select capacity with `tags:` in their jobs. The `ci-jobs` namespace carries a default-deny egress NetworkPolicy allowing only ECR/S3/STS endpoints and GitLab.
+
+#### 4.10.2 EC2 autoscaling runners (fleeting) — full-VM jobs
+
+For jobs needing a whole machine (kernel modules, heavyweight integration tests), a runner manager drives an ASG of golden-AMI instances via the AWS fleeting plugin:
+
+```toml
+[[runners]]
+  executor = "instance"
+  [runners.autoscaler]
+    plugin = "fleeting-plugin-aws"
+    capacity_per_instance = 1
+    max_use_count = 1                # fresh VM per job — zero cross-job contamination
+    max_instances = 10
+    [runners.autoscaler.plugin_config]
+      name = "ci-runner-asg"         # ASG launch template pinned to /corp/ami/.../current
+    [[runners.autoscaler.policy]]
+      idle_count = 1
+      idle_time  = "20m"
+```
+
+Instances carry `corp:role=ci-runner` (tag-targeted by SSM), instance profile `ci-runner-base`, and refresh onto each promoted AMI via `start-instance-refresh` (§6.13).
+
+#### 4.10.3 IAM roles for runners and pipelines — two supported patterns
+
+**Pattern 1 — OIDC federation (preferred; zero stored cloud credentials).** AWS IAM must fetch GitLab's OIDC discovery + JWKS to validate job tokens. GitLab stays corp-only: publish *just* the two read-only documents (`/.well-known/openid-configuration`, `/oauth/discovery/keys`) at the issuer URL via CloudFront/S3 or a reverse proxy exposing nothing else. If corp policy forbids even that, use Pattern 2.
+
+```hcl
+resource "aws_iam_openid_connect_provider" "gitlab" {
+  url            = "https://gitlab.corp.example.com"
+  client_id_list = ["https://gitlab.corp.example.com"]   # must equal the job's aud claim
+}
+
+# Per-team deploy role — trust scoped to project path + protected branch
+data "aws_iam_policy_document" "gitlab_trust" {
+  statement {
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+    principals {
+      type        = "Federated"
+      identifiers = [aws_iam_openid_connect_provider.gitlab.arn]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "gitlab.corp.example.com:aud"
+      values   = ["https://gitlab.corp.example.com"]
+    }
+    condition {
+      test     = "StringLike"
+      variable = "gitlab.corp.example.com:sub"
+      values   = ["project_path:data-analytics/*:ref_type:branch:ref:main"]
+    }
+  }
+}
+
+resource "aws_iam_role" "ci_deploy_analytics" {
+  name                 = "data-analytics-deploy"
+  path                 = "/ci/"
+  assume_role_policy   = data.aws_iam_policy_document.gitlab_trust.json
+  max_session_duration = 3600
+  # Attached permissions stay least-priv: ECR push to the team prefix, the team's
+  # namespaced EKS access policy, S3 to the team artifact prefix — nothing else.
+}
+```
+
+Job side (this snippet ships in the shared `corp/ci-templates` so teams never hand-roll it):
+
+```yaml
+deploy:
+  id_tokens:
+    AWS_ID_TOKEN: { aud: "https://gitlab.corp.example.com" }
+  environment: production          # protected environment → only protected refs may run this
+  script:
+    - >
+      export $(printf "AWS_ACCESS_KEY_ID=%s AWS_SECRET_ACCESS_KEY=%s AWS_SESSION_TOKEN=%s"
+      $(aws sts assume-role-with-web-identity
+      --role-arn arn:aws:iam::111122223333:role/ci/data-analytics-deploy
+      --role-session-name "gl-${CI_PROJECT_ID}-${CI_PIPELINE_ID}"
+      --web-identity-token "$AWS_ID_TOKEN" --duration-seconds 3600
+      --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text))
+    - aws sts get-caller-identity
+```
+
+The session-name convention **`gl-<project>-<pipeline>`** makes every CloudTrail event attributable to an exact pipeline, commit, and author — the audit hook used in §6.13 and §8.12.
+
+**Pattern 2 — fully closed (no public JWKS at all).** The runner's infrastructure identity (Pod Identity for the EKS fleet, instance profile for the ASG fleet) is a base role that can do exactly one thing:
+
+```hcl
+resource "aws_iam_role_policy" "runner_base" {
+  role = aws_iam_role.ci_runner_base.id
+  name = "assume-team-deploy-roles-only"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "sts:AssumeRole"
+      Resource = "arn:aws:iam::111122223333:role/ci/*"
+    }]
+  })
+}
+```
+
+Each `ci/<team>-deploy` role trusts `ci-runner-base` **plus a per-project `sts:ExternalId`** stored as a *protected + masked* CI variable — so only pipelines on protected refs of that project can assume it:
+
+```bash
+aws sts assume-role --role-arn arn:aws:iam::111122223333:role/ci/data-analytics-deploy   --external-id "$CI_EXTERNAL_ID" --role-session-name "gl-${CI_PROJECT_ID}-${CI_PIPELINE_ID}"
+```
+
+Runner separation completes the control: deploy-capable runners are registered as **protected runners** with distinct tags, so unprotected/MR pipelines physically never land on them.
+
+#### 4.10.4 Roles for users
+
+GitLab SSO is Keycloak OIDC (§4.8). The same groups that drive EKS RBAC drive GitLab membership, so the quarterly review (§6.11) covers both systems in one pass:
+
+| Keycloak group | GitLab role | EKS (via §4.8) |
+|---|---|---|
+| `platform-admins` | Owner on the platform group; Maintainer elsewhere | admin access policies |
+| `data-engineers` | Developer on `data-analytics/*` | edit in team namespaces |
+| `data-analysts` | Reporter | view |
+| `security` | Auditor (instance-wide read) | view + audit logs |
+
+Platform-owned guardrails: protected branches (`main`, `release/*`) and the `production` protected environment gate merges and deploys behind Maintainer approval; ExternalIds live only in protected+masked variables; `.gitlab-ci.yml` on protected branches requires code-owner approval (enforced check in §8.12 prevention).
+
 ---
 ## 5. Day-to-Day Runbooks
 
@@ -1516,6 +1688,32 @@ aws ssm send-command --document-name AWS-RunShellScript \
   --targets "Key=tag:corp:role,Values=kafka,postgres,nifi" \
   --parameters 'commands=["systemctl --failed --no-legend || true","df -h /data | tail -1"]'
 ```
+
+### 5.14 GitLab runner fleet daily (D16)
+
+```bash
+GL=https://gitlab.corp.example.com/api/v4          # q() = Prometheus helper from §5.1
+
+# Kubernetes-executor fleet
+kubectl -n gitlab-runners get pods -o wide
+kubectl -n ci-jobs get pods --field-selector=status.phase=Pending --no-headers | wc -l   # stuck job pods
+
+# GitLab's view — offline/stale runners (admin PAT, read_api scope):
+curl -s --header "PRIVATE-TOKEN: $GL_ADMIN_TOKEN" "$GL/runners/all?status=offline"   | jq -r '.[] | "\(.id) \(.description) last=\(.contacted_at)"'
+
+# Queue pressure & saturation (runner Prometheus metrics):
+q 'sum(gitlab_runner_jobs{state="running"})'
+q 'sum(gitlab_runner_concurrent) - sum(gitlab_runner_jobs{state="running"})'   # free slots
+q 'histogram_quantile(0.95, sum(rate(gitlab_runner_job_queue_duration_seconds_bucket[1h])) by (le))'
+
+# EC2 autoscaling fleet
+aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names ci-runner-asg   --query 'AutoScalingGroups[0].{desired:DesiredCapacity,healthy:length(Instances[?HealthStatus==`Healthy`])}'
+
+# Cache bucket reachable from inside a job pod (proves the S3 gateway path):
+kubectl -n ci-jobs run cache-probe --rm -i --restart=Never   --image=111122223333.dkr.ecr.us-east-1.amazonaws.com/tools/ci-base:al2023   -- aws s3 ls s3://corp-ci-cache --page-size 1 >/dev/null && echo PASS cache || echo FAIL cache
+```
+
+Most common finding: runner pods CrashLooping right after a token rotation — re-sync the `gitlab-runner-token` Secret and `rollout restart` (§6.13 step 2 does it in order).
 
 ---
 ## 6. Periodic Runbooks
@@ -2020,6 +2218,32 @@ aws compute-optimizer get-ec2-instance-recommendations \
   --query 'instanceRecommendations[].[instanceArn,currentInstanceType,recommendationOptions[0].instanceType]' --output table
 ```
 
+### 6.13 GitLab runner lifecycle (P17)
+
+```bash
+GL=https://gitlab.corp.example.com/api/v4
+
+# 1. Version: bump runners the same week the corp GitLab team upgrades the server —
+#    runner minor tracks the GitLab minor. Re-check the helper_image pin, then gate:
+helm upgrade gitlab-runner corp-helm/gitlab-runner --version <chart> -n gitlab-runners -f values-airgap.yaml
+#    Canary pipeline (corp/ci-templates canary project: build → cache → assume-role → deploy-dryrun)
+#    must pass before upgrading the remaining runner classes.
+
+# 2. Rotate runner authentication tokens (quarterly, or immediately on suspicion):
+NEW=$(curl -s -X POST --header "PRIVATE-TOKEN: $GL_ADMIN_TOKEN"   "$GL/runners/$RUNNER_ID/reset_authentication_token" | jq -r .token)
+kubectl -n gitlab-runners create secret generic gitlab-runner-token   --from-literal=runner-token=$NEW --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n gitlab-runners rollout restart deploy/gitlab-runner
+
+# 3. EC2 fleet onto the current golden AMI (rides the §6.2 promotion):
+aws autoscaling start-instance-refresh --auto-scaling-group-name ci-runner-asg   --preferences '{"MinHealthyPercentage":50}'
+
+# 4. CI deploy-role audit (joins the §6.11 review):
+aws iam list-roles --path-prefix /ci/   --query 'Roles[].[RoleName,MaxSessionDuration]' --output table
+#    Athena/CloudTrail: sessions with role-session-name prefix "gl-" → project→role usage map;
+#    delete roles unused 90d; verify every trust still pins project_path + protected ref
+#    (Pattern 1) or a per-project ExternalId (Pattern 2). Wildcard subs are a finding.
+```
+
 ---
 ## 7. Zero-Day Response & Forensics
 
@@ -2351,6 +2575,30 @@ Finding: `CryptoCurrency:Runtime/BitcoinTool.B!DNS` on `i-0abc...`, pod `agents/
 - **Follow-ups beyond §7.5:** Harbor-scan the exact image digest; diff its SBOM against the previous tag; revoke and re-issue the namespace's pod-identity associations; add a NetworkPolicy default-deny egress for `agents` (only Kafka/OpenSearch/model endpoints allowed); feed the IOCs (domains, binary hashes) to corp SOC.
 - **Evidence pack:** GuardDuty finding JSON, §7.5 volatile capture + memory image + snapshots, K8s audit slice, the image digest + SBOM diff — all under `s3://corp-forensics/IR-.../` (Object Lock).
 
+### 8.11 What if every pipeline sits `pending`? (runners offline)
+
+- **Symptoms:** Jobs queue for minutes→hours; GitLab runners page shows offline/stale; every team blocked at once.
+- **Triage:** `kubectl -n gitlab-runners get pods` + `logs deploy/gitlab-runner | tail -30` — auth errors (token rotated but Secret not updated) vs network errors; reachability over TGW: `kubectl -n gitlab-runners exec deploy/gitlab-runner -- curl -m5 -skI https://gitlab.corp.example.com | head -1`; ASG health (§5.14); the **air-gap classic**: after a chart bump the `helper_image` pin was dropped → job pods stuck `ContainerCreating` trying to pull `registry.gitlab.com` (blocked) — `kubectl -n ci-jobs describe pod <j> | grep -A4 Events` shows it instantly.
+- **Likely causes:** token rotation half-done, lost helper-image pin, TGW/SG change between VPC and GitLab, ASG at zero or LT pointing at a deregistered AMI.
+- **Fix:** per cause — §6.13 step 2 in full for tokens; restore the pin and rollout; revert the network change; `update-auto-scaling-group --desired-capacity` / fix the LT AMI and instance-refresh.
+- **Forensics:** git history of the values repo (who changed what), GitLab audit events for runner pause/delete, CloudTrail on the ASG/SG.
+- **Prevention:** the §6.13 canary-pipeline gate; alert when `sum(gitlab_runner_jobs{state="running"}) == 0` in business hours while queue p95 rises; a lint in the values repo that fails if `helper_image` doesn't point at ECR.
+
+### 8.12 What if a CI job leaks its cloud credentials?
+
+- **Symptoms:** GuardDuty credential-exfiltration-class finding or anomalous CloudTrail calls from a `gl-*` role session; or a team reports a malicious MR editing `.gitlab-ci.yml`.
+- **Why the blast radius is small by design (§4.10.3):** credentials live 1h, scoped to a single team deploy role, bound to protected refs (Pattern 1 `sub` condition / Pattern 2 protected ExternalId); fork/MR pipelines never see them; `ci-jobs` egress is default-deny except ECR/S3/STS/GitLab, so most exfil paths are dead ends.
+- **Contain:**
+  ```bash
+  # Kill the stolen session NOW — same revocation pattern as §7.5 step 5, on the DEPLOY role:
+  aws iam put-role-policy --role-name data-analytics-deploy --policy-name AWSRevokeOlderSessions     --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"*","Resource":"*",
+      "Condition":{"DateLessThan":{"aws:TokenIssueTime":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}}}]}'
+  # Pattern 2: rotate the ExternalId; Pattern 1: temporarily drop the OIDC trust statement.
+  curl -s -X PUT --header "PRIVATE-TOKEN: $GL_ADMIN_TOKEN" "$GL/runners/$RUNNER_ID" --form paused=true
+  ```
+- **Trace:** CloudTrail where `userIdentity.arn` contains the session name `gl-<project>-<pipeline>` → exact project, pipeline, commit, author; the pipeline job log and MR diff are the other half of the timeline. Cross-check GitLab audit events for who approved the MR.
+- **Recover & prevent:** rotate everything the role could read; re-enable trust with tightened conditions; add the offending pattern to the pipeline-template lint (e.g. forbid `echo $AWS_*`, curl to non-allowlisted hosts); require code-owner approval for `.gitlab-ci.yml` changes on protected branches.
+
 ---
 ## 9. Appendices
 
@@ -2376,7 +2624,7 @@ Finding: `CryptoCurrency:Runtime/BitcoinTool.B!DNS` on `i-0abc...`, pod `agents/
 |---|---|---|
 | `corp:team` | `data-analytics` | Cost allocation, budgets, ownership paging |
 | `corp:environment` | `prod` \| `nonprod` | Patch rings, guardrails |
-| `corp:role` | `kafka` \| `postgres` \| `nifi` \| `eks-node` | SSM targeting, prereq association, SGs |
+| `corp:role` | `kafka` \| `postgres` \| `nifi` \| `eks-node` \| `ci-runner` | SSM targeting, prereq association, SGs |
 | `corp:patch-group` | `datanode-kafka` … | Patch baselines & windows (§6.3) |
 | `corp:backup` | `daily` | AWS Backup selection (§6.8) |
 | `corp:approved` | `true` \| `pending-canary` \| `false` | Karpenter AMI drift gate (§6.2) |
@@ -2397,6 +2645,7 @@ aws ssm start-session --target i-0abc123def456          # never SSH
 aws ec2 describe-vpc-endpoints --query 'VpcEndpoints[?State!=`available`].[ServiceName]'
 aws ce get-anomalies --date-interval StartDate=$(date -d '2 days ago' +%F),EndDate=$(date +%F)
 velero backup get | tail -3
+curl -s --header "PRIVATE-TOKEN: $GL_ADMIN_TOKEN" "https://gitlab.corp.example.com/api/v4/runners/all?status=offline" | jq length
 ```
 
 ### Appendix D — Version pin reference (`platform/versions.yaml`, reviewed monthly)
@@ -2420,6 +2669,7 @@ opensearch_engine: "OpenSearch_2.19"
 java: "corretto-21"
 terraform: ">= 1.10"          # S3-native locking (use_lockfile)
 aws_provider: "~> 6.0"
+gitlab_runner: "tracks corp GitLab minor"   # helper_image pin lives in the runner values (§4.10)
 ```
 
 ---
